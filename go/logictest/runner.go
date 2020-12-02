@@ -34,9 +34,10 @@ import (
 var currTestFile string
 var currRecord *parser.Record
 var _, TruncateQueriesInLog = os.LookupEnv("SQLLOGICTEST_TRUNCATE_QUERIES")
+var ExitOnNotOk = false
 
 var startTime time.Time
-var timeout = time.Minute * 20
+var Timeout = time.Minute * 20
 var testTimeoutError = errors.New("test in file timed out")
 
 // Runs the test files found under any of the paths given. Can specify individual test files, or directories that
@@ -46,7 +47,29 @@ func RunTestFiles(harness Harness, paths ...string) {
 	testFiles := collectTestFiles(paths)
 
 	for _, file := range testFiles {
-		runTestFile(harness, file)
+		cont := runTestFile(harness, file, true)
+		if ExitOnNotOk && !cont {
+			return
+		}
+	}
+}
+
+// Runs the test files found under any of the paths given. Can specify individual test files, or directories that
+// contain test files somewhere underneath. All files named *.test encountered under a directory will be attempted to be
+// parsed as a test file, and will panic for malformed test files or paths that don't exist. Will only call Init on the
+// given harness at the beginning of execution, rather than before every test file.
+func RunTestFilesSingleInit(harness Harness, paths ...string) {
+	testFiles := collectTestFiles(paths)
+
+	err := harness.Init()
+	if err != nil {
+		panic(err)
+	}
+	for _, file := range testFiles {
+		cont := runTestFile(harness, file, false)
+		if ExitOnNotOk && !cont {
+			return
+		}
 	}
 }
 
@@ -91,16 +114,33 @@ func GenerateTestFiles(harness Harness, paths ...string) {
 	testFiles := collectTestFiles(paths)
 
 	for _, file := range testFiles {
-		generateTestFile(harness, file)
+		generateTestFile(harness, file, true)
 	}
 }
 
-func generateTestFile(harness Harness, f string) {
-	currTestFile = f
+// Generates the test files given by executing the query and replacing expected results with the ones obtained by the
+// test run. Files written will have the .generated suffix. Will only call Init on the given harness at the beginning
+// of execution, rather than before every test file.
+func GenerateTestFilesSingleInit(harness Harness, paths ...string) {
+	testFiles := collectTestFiles(paths)
 
 	err := harness.Init()
 	if err != nil {
 		panic(err)
+	}
+	for _, file := range testFiles {
+		generateTestFile(harness, file, false)
+	}
+}
+
+func generateTestFile(harness Harness, f string, init bool) bool {
+	currTestFile = f
+
+	if init {
+		err := harness.Init()
+		if err != nil {
+			panic(err)
+		}
 	}
 
 	file, err := os.Open(f)
@@ -136,10 +176,14 @@ func generateTestFile(harness Harness, f string) {
 	}()
 
 	for _, record := range testRecords {
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		ctx, cancel := context.WithTimeout(context.Background(), Timeout)
 		lockCtx := context.WithValue(ctx, "lock", &loggingLock{})
 
-		schema, records, _, err := executeRecord(lockCtx, cancel, harness, record)
+		schema, records, cont, err := executeRecord(lockCtx, cancel, harness, record)
+
+		if ExitOnNotOk && !cont {
+			return false
+		}
 
 		// If there was an error or we skipped this test, then just copy output until the next record.
 		if err != nil || !record.ShouldExecuteForEngine(harness.EngineStr()) {
@@ -147,7 +191,7 @@ func generateTestFile(harness Harness, f string) {
 			continue
 		} else if record.Type() == parser.Halt {
 			copyRestOfFile(scanner, wr)
-			return
+			return true
 		}
 
 		// Copy until we get to the line before the query we executed (e.g. "query IIRT no-sort")
@@ -174,6 +218,7 @@ func generateTestFile(harness Harness, f string) {
 	}
 
 	copyRestOfFile(scanner, wr)
+	return true
 }
 
 func writeLine(wr *bufio.Writer, s string) {
@@ -241,12 +286,14 @@ type loggingLock struct {
 	logged bool
 }
 
-func runTestFile(harness Harness, file string) {
+func runTestFile(harness Harness, file string, init bool) bool {
 	currTestFile = file
 
-	err := harness.Init()
-	if err != nil {
-		panic(err)
+	if init {
+		err := harness.Init()
+		if err != nil {
+			panic(err)
+		}
 	}
 
 	testRecords, err := parser.ParseTestFile(file)
@@ -259,7 +306,7 @@ func runTestFile(harness Harness, file string) {
 		currRecord = record
 		startTime = time.Now()
 
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		ctx, cancel := context.WithTimeout(context.Background(), Timeout)
 		lockCtx := context.WithValue(ctx, "lock", &loggingLock{})
 
 		if dnr {
@@ -273,9 +320,15 @@ func runTestFile(harness Harness, file string) {
 		}
 
 		if !cont {
-			break
+			if ExitOnNotOk {
+				return false
+			} else {
+				break
+			}
 		}
 	}
+
+	return true
 }
 
 type R struct {
@@ -291,6 +344,7 @@ func executeRecord(ctx context.Context, cancel context.CancelFunc, harness Harne
 
 	rc := make(chan *R, 1)
 	go func() {
+		currRecord = record
 		schema, results, cont, err := execute(ctx, harness, record)
 		rc <- &R{
 			schema: schema,
@@ -304,8 +358,8 @@ func executeRecord(ctx context.Context, cancel context.CancelFunc, harness Harne
 	case res := <-rc:
 		return res.schema, res.results, res.cont, res.err
 	case <-ctx.Done():
-		logResult(ctx, Timeout, "")
-		return "", []string{}, true, testTimeoutError
+		logResult(ctx, Timedout, "")
+		return "", []string{}, !ExitOnNotOk, testTimeoutError
 	}
 }
 
@@ -322,7 +376,7 @@ func execute(ctx context.Context, harness Harness, record *parser.Record) (schem
 			}
 			logResult(ctx, NotOk, "Caught panic: %v", toLog)
 			fmt.Println("stacktrace from panic: \n" + string(debug.Stack()))
-			cont = true
+			cont = !ExitOnNotOk
 		}
 	}()
 
@@ -341,11 +395,11 @@ func execute(ctx context.Context, harness Harness, record *parser.Record) (schem
 		if record.ExpectError() {
 			if err == nil {
 				logResult(ctx, NotOk, "Expected error but didn't get one")
-				return "", nil, true, nil
+				return "", nil, !ExitOnNotOk, nil
 			}
 		} else if err != nil {
 			logResult(ctx, NotOk, "Unexpected error %v", err)
-			return "", nil, true, err
+			return "", nil, !ExitOnNotOk, err
 		}
 
 		logResult(ctx, Ok, "")
@@ -354,12 +408,12 @@ func execute(ctx context.Context, harness Harness, record *parser.Record) (schem
 		schemaStr, results, err := harness.ExecuteQuery(record.Query())
 		if err != nil {
 			logResult(ctx, NotOk, "Unexpected error %v", err)
-			return "", nil, true, err
+			return "", nil, !ExitOnNotOk, err
 		}
 
 		// Only log one error per record, so if schema comparison fails don't bother with result comparison
-		if verifySchema(ctx, record, schemaStr) {
-			verifyResults(ctx, record, schemaStr, results)
+		if !verifySchema(ctx, record, schemaStr) || !verifyResults(ctx, record, schemaStr, results) {
+			return schemaStr, results, !ExitOnNotOk, nil
 		}
 		return schemaStr, results, true, nil
 	case parser.Halt:
@@ -369,19 +423,19 @@ func execute(ctx context.Context, harness Harness, record *parser.Record) (schem
 	}
 }
 
-func verifyResults(ctx context.Context, record *parser.Record, schema string, results []string) {
+func verifyResults(ctx context.Context, record *parser.Record, schema string, results []string) bool {
 	if len(results) != record.NumResults() {
 		logResult(ctx, NotOk, fmt.Sprintf("Incorrect number of results. Expected %v, got %v", record.NumResults(), len(results)))
-		return
+		return false
 	}
 
 	results = normalizeResults(results, record.Schema())
 	results = record.SortResults(results)
 
 	if record.IsHashResult() {
-		verifyHash(ctx, record, results)
+		return verifyHash(ctx, record, results)
 	} else {
-		verifyRows(ctx, record, results)
+		return verifyRows(ctx, record, results)
 	}
 }
 
@@ -407,33 +461,36 @@ func normalizeResults(results []string, schema string) []string {
 }
 
 // Verifies that the rows given exactly match the expected rows of the record, in the order given. Rows must have been
-// previously sorted according to the semantics of the record.
-func verifyRows(ctx context.Context, record *parser.Record, results []string) {
+// previously sorted according to the semantics of the record. Returns whether the verification succeeded.
+func verifyRows(ctx context.Context, record *parser.Record, results []string) bool {
 	for i := range record.Result() {
 		if record.Result()[i] != results[i] {
 			logResult(ctx, NotOk, "Incorrect result at position %d. Expected %v, got %v", i, record.Result()[i], results[i])
-			return
+			return false
 		}
 	}
 
 	logResult(ctx, Ok, "")
+	return true
 }
 
 // Verifies that the hash of the rows given exactly match the expected hash of the record given. Rows must have been
-// previously sorted according to the semantics of the record.
-func verifyHash(ctx context.Context, record *parser.Record, results []string) {
+// previously sorted according to the semantics of the record. Returns whether the verification succeeded.
+func verifyHash(ctx context.Context, record *parser.Record, results []string) bool {
 	results = record.SortResults(results)
 
 	computedHash, err := hashResults(results)
 	if err != nil {
 		logResult(ctx, NotOk, "Error hashing results: %v", err)
-		return
+		return false
 	}
 
 	if record.HashResult() != computedHash {
 		logResult(ctx, NotOk, "Hash of results differ. Expected %v, got %v", record.HashResult(), computedHash)
+		return false
 	} else {
 		logResult(ctx, Ok, "")
+		return true
 	}
 }
 
@@ -501,7 +558,7 @@ func logResult(ctx context.Context, rt ResultType, message string, args ...inter
 		logFailure(message, args...)
 	case Skipped:
 		logSkip()
-	case Timeout:
+	case Timedout:
 		logTimeout()
 	case DidNotRun:
 		logDidNotRun()

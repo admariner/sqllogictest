@@ -45,6 +45,7 @@ func ParseTestFile(f string) ([]*Record, error) {
 	var records []*Record
 
 	scanner := LineScanner{bufio.NewScanner(file), 0}
+	scanner.Scanner.Buffer(make([]byte, 4*1024*1024), 128*1024*1024)
 	var prevRecord *Record
 
 	for {
