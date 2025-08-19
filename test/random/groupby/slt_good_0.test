@@ -1,6 +1,9 @@
 hash-threshold 8
 
 statement ok
+SET SESSION sql_mode=(SELECT REPLACE(@@sql_mode,'ONLY_FULL_GROUP_BY',''))
+
+statement ok
 CREATE TABLE tab0(col0 INTEGER, col1 INTEGER, col2 INTEGER)
 
 statement ok
